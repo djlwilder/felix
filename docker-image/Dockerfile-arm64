@@ -1,9 +1,9 @@
-FROM ppc64le/alpine:3.6
+FROM arm64v8/alpine:3.6
 MAINTAINER Shaun Crampton <shaun@tigera.io>
 
 # Enable non-native builds of this image on an amd64 hosts.
 # This must be positioned as the first executable command in this file! 
-COPY  qemu-ppc64le-static /usr/bin/qemu-ppc64le-static
+COPY  qemu-aarch64-static /usr/bin/qemu-aarch64-static
 
 # Since our binary isn't designed to run as PID 1, run it via the tini init daemon.
 RUN apk --no-cache add --update tini

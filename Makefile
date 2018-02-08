@@ -46,9 +46,11 @@
 # For example: When building on ppc64le you could use ARCH=ppc64le make <....>.
 # When ARCH is undefined it defaults to amd64.
 ARCH?=amd64
+BUILDARCH?=amd64
+
 ifeq ($(ARCH),amd64)
 	ARCHTAG?=
-	GO_BUILD_VER?=v0.9
+	GO_BUILD_VER?=latest
 	FV_TYPHAIMAGE?=calico/typha:v0.6.0-beta1-16-g512a0f2
 endif
 
@@ -58,7 +60,21 @@ ifeq ($(ARCH),ppc64le)
 	FV_TYPHAIMAGE?=calico/typha-ppc64le:latest
 endif
 
-GO_BUILD_CONTAINER?=calico/go-build$(ARCHTAG):$(GO_BUILD_VER)
+ifeq ($(ARCH),arm64)
+	ARCHTAG:=-arm64
+	GO_BUILD_VER?=latest
+	FV_TYPHAIMAGE?=calico/typha-arm64:latest
+endif
+
+# Cross building?
+ifneq ($(ARCH),$(BUILDARCH))
+	GO_BUILD_CONTAINER?=calico/go-build:$(GO_BUILD_VER)-$(BUILDARCH)
+	# this should be calico/protoc-$(BUILDARCH) but amd64 omits the arch tag.
+	PROTOC_CONTAINER?=calico/protoc
+endif
+GO_BUILD_CONTAINER?=calico/go-build:$(GO_BUILD_VER)$(ARCHTAG)
+PROTOC_CONTAINER?=calico/protoc$(ARCHTAG)
+
 FV_ETCDIMAGE?=quay.io/coreos/etcd:v3.2.5$(ARCHTAG)
 FV_K8SIMAGE?=gcr.io/google_containers/hyperkube$(ARCHTAG):v1.7.5
 FV_GINKGO_NODES?=4
@@ -94,6 +110,12 @@ help:
 	@echo "                      in glide.lock."
 	@echo "  make go-fmt        Format our go code."
 	@echo "  make clean         Remove binary files."
+	@echo "-----------------------------------------"
+	@echo ARCH: 		  $(ARCH)
+	@echo BUILDARCH: 	  $(BUILDARCH)
+	@echo GO_BUILD_CONTAINER: $(GO_BUILD_CONTAINER)
+	@echo PROTOC_CONTAINER:   $(PROTOC_CONTAINER)
+	@echo "-----------------------------------------"
 
 TOPDIR:=$(shell pwd)
 
@@ -101,7 +123,7 @@ TOPDIR:=$(shell pwd)
 # considerably.
 .SUFFIXES:
 
-all: deb rpm calico/felix
+all: deb rpm calico/felix$(ARCHTAG)
 test: ut fv
 
 # Figure out version information.  To support builds from release tarballs, we default to
@@ -173,11 +195,29 @@ calico-build/centos6:
 	  -t calico-build/centos6 .
 
 # Build the calico/felix docker image, which contains only Felix.
-.PHONY: calico/felix
-calico/felix: bin/calico-felix
+.PHONY: calico/felix calico/felix$(ARCHTAG) register 
+
+# Enable binfmt adding support for miscellaneous binary formats.
+# This is needed for building non-native images.
+register:
+	sudo docker run --rm --privileged multiarch/qemu-user-static:register || true
+
+docker-image/qemu-ppc64le-static:
+	wget https://github.com/multiarch/qemu-user-static/releases/download/v2.9.1/qemu-ppc64le-static.tar.gz
+	tar zxvf qemu-ppc64le-static.tar.gz -C docker-image
+	rm qemu-ppc64le-static.tar.gz
+
+docker-image/qemu-aarch64-static:
+	wget https://github.com/multiarch/qemu-user-static/releases/download/v2.9.1-1/qemu-aarch64-static.tar.gz
+	tar zxvf qemu-aarch64-static.tar.gz  -C docker-image
+	rm qemu-aarch64-static.tar.gz
+
+calico/felix: calico/felix$(ARCHTAG)
+
+calico/felix$(ARCHTAG): bin/calico-felix-$(ARCH) register docker-image/qemu-ppc64le-static docker-image/qemu-aarch64-static
 	rm -rf docker-image/bin
 	mkdir -p docker-image/bin
-	cp bin/calico-felix docker-image/bin/
+	cp bin/calico-felix-$(ARCH) docker-image/bin/calico-felix
 	docker build --pull -t calico/felix$(ARCHTAG) --file ./docker-image/Dockerfile$(ARCHTAG) docker-image
 
 # Targets for Felix testing with the k8s backend and a k8s API server,
@@ -255,6 +295,7 @@ DOCKER_GO_BUILD := mkdir -p .go-pkg-cache && \
                               -v $${PWD}:/go/src/github.com/projectcalico/felix:rw \
                               -v $${PWD}/.go-pkg-cache:/go/pkg:rw \
                               -w /go/src/github.com/projectcalico/felix \
+                              -e GOARCH=$(ARCH) \
                               $(GO_BUILD_CONTAINER)
 
 # Build all the debs.
@@ -285,7 +326,7 @@ protobuf: proto/felixbackend.pb.go
 # Generate the protobuf bindings for go.
 proto/felixbackend.pb.go: proto/felixbackend.proto
 	$(DOCKER_RUN_RM) -v $${PWD}/proto:/src:rw \
-	              calico/protoc$(ARCHTAG) \
+		      $(PROTOC_CONTAINER) \
 	              --gogofaster_out=. \
 	              felixbackend.proto
 
@@ -325,14 +366,14 @@ LDFLAGS:=-ldflags "\
         -X github.com/projectcalico/felix/buildinfo.GitRevision=$(GIT_COMMIT) \
         -B 0x$(BUILD_ID)"
 
-bin/calico-felix: $(FELIX_GO_FILES) vendor/.up-to-date
+bin/calico-felix-$(ARCH): $(FELIX_GO_FILES) vendor/.up-to-date
 	@echo Building felix...
 	mkdir -p bin
 	$(DOCKER_GO_BUILD) \
 	   sh -c 'go build -v -i -o $@ -v $(LDFLAGS) "github.com/projectcalico/felix" && \
-		( ldd bin/calico-felix 2>&1 | grep -q -e "Not a valid dynamic program" \
+		( ldd $@ 2>&1 | grep -q -e "Not a valid dynamic program" \
 		-e "not a dynamic executable" || \
-		( echo "Error: bin/calico-felix was not statically linked"; false ) )'
+		( echo "Error: $@ was not statically linked"; false ) )'
 
 bin/iptables-locker: $(FELIX_GO_FILES) vendor/.up-to-date
 	@echo Building iptables-locker...
