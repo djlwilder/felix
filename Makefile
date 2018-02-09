@@ -42,41 +42,37 @@
 #
 #
 ###############################################################################
+# Both native and cross architecture builds are supported.
 # The build architecture is select by setting the ARCH variable.
-# For example: When building on ppc64le you could use ARCH=ppc64le make <....>.
-# When ARCH is undefined it defaults to amd64.
-ARCH?=amd64
-BUILDARCH?=amd64
+# When ARCH is undefined it is set to the detected architecture.
+# When ARCH differes from the detected architecture a crossbuild will be performed.
 
-ifeq ($(ARCH),amd64)
-	ARCHTAG?=
-	GO_BUILD_VER?=latest
-	FV_TYPHAIMAGE?=calico/typha:v0.6.0-beta1-16-g512a0f2
+# MYARCH is the architecture we are currently running on.
+MYARCH=$(shell uname -m)
+ifeq ($(MYARCH),aarch64)
+        MYARCH=arm64
+endif
+ifeq ($(MYARCH),x86_64)
+        MYARCH=amd64
+endif
+ARCH?=$(MYARCH)
+
+GO_BUILD_VER?=latest
+GO_BUILD_CONTAINER=calico/go-build:$(GO_BUILD_VER)-$(MYARCH)
+PROTOC_VER?=latest
+PROTOC_CONTAINER?=calico/protoc-$(MYARCH):$(PROTOC_VER)
+FV_ETCDIMAGE?=quay.io/coreos/etcd:v3.2.5-$(MYARCH)
+FV_K8SIMAGE?=gcr.io/google_containers/hyperkube-$(MYARCH):v1.7.5
+FV_TYPHAIMAGE?=calico/typha-$(MYARCH):latest
+
+# If building on amd64 omit the arch in the container name.  Fixme!
+ifeq ($(MYARCH),amd64)
+        PROTOC_CONTAINER=calico/protoc:$(PROTOC_VER)
+        FV_ETCDIMAGE=quay.io/coreos/etcd:v3.2.5
+        FV_K8SIMAGE=gcr.io/google_containers/hyperkube:v1.7.5
+        FV_TYPHAIMAGE=calico/typha:v0.6.0-beta1-16-g512a0f2
 endif
 
-ifeq ($(ARCH),ppc64le)
-	ARCHTAG:=-ppc64le
-	GO_BUILD_VER?=latest
-	FV_TYPHAIMAGE?=calico/typha-ppc64le:latest
-endif
-
-ifeq ($(ARCH),arm64)
-	ARCHTAG:=-arm64
-	GO_BUILD_VER?=latest
-	FV_TYPHAIMAGE?=calico/typha-arm64:latest
-endif
-
-# Cross building?
-ifneq ($(ARCH),$(BUILDARCH))
-	GO_BUILD_CONTAINER?=calico/go-build:$(GO_BUILD_VER)-$(BUILDARCH)
-	# this should be calico/protoc-$(BUILDARCH) but amd64 omits the arch tag.
-	PROTOC_CONTAINER?=calico/protoc
-endif
-GO_BUILD_CONTAINER?=calico/go-build:$(GO_BUILD_VER)$(ARCHTAG)
-PROTOC_CONTAINER?=calico/protoc$(ARCHTAG)
-
-FV_ETCDIMAGE?=quay.io/coreos/etcd:v3.2.5$(ARCHTAG)
-FV_K8SIMAGE?=gcr.io/google_containers/hyperkube$(ARCHTAG):v1.7.5
 FV_GINKGO_NODES?=4
 
 help:
@@ -112,9 +108,12 @@ help:
 	@echo "  make clean         Remove binary files."
 	@echo "-----------------------------------------"
 	@echo ARCH: 		  $(ARCH)
-	@echo BUILDARCH: 	  $(BUILDARCH)
+	@echo MYARCH:	          $(MYARCH)
 	@echo GO_BUILD_CONTAINER: $(GO_BUILD_CONTAINER)
 	@echo PROTOC_CONTAINER:   $(PROTOC_CONTAINER)
+	@echo FV_ETCDIMAGE:       $(FV_ETCDIMAGE)
+	@echo FV_K8SIMAGE:        $(FV_K8SIMAGE)
+	@echo FV_TYPHAIMAGE:      $(FV_TYPHAIMAGE)
 	@echo "-----------------------------------------"
 
 TOPDIR:=$(shell pwd)
@@ -123,8 +122,40 @@ TOPDIR:=$(shell pwd)
 # considerably.
 .SUFFIXES:
 
-all: deb rpm calico/felix$(ARCHTAG)
+all: deb rpm calico/felix-$(ARCH)
 test: ut fv
+
+# Targets used when cross building.
+.PHONY: native register
+native:
+ifneq ($(MYARCH),$(ARCH))
+	@echo "Target $(MAKECMDGOALS)" is not supported when cross building! && false
+endif
+
+# Enable binfmt adding support for miscellaneous binary formats.
+# This is only needed when running non-native binaries.
+register:
+ifneq ($(MYARCH),$(ARCH))
+	sudo docker run --rm --privileged multiarch/qemu-user-static:register || true
+endif
+
+docker-image/qemu-ppc64le-static:
+	wget https://github.com/multiarch/qemu-user-static/releases/download/v2.9.1/qemu-ppc64le-static.tar.gz
+	tar zxvf qemu-ppc64le-static.tar.gz -C docker-image
+	rm qemu-ppc64le-static.tar.gz
+
+docker-image/qemu-aarch64-static:
+	wget https://github.com/multiarch/qemu-user-static/releases/download/v2.9.1-1/qemu-aarch64-static.tar.gz
+	tar zxvf qemu-aarch64-static.tar.gz  -C docker-image
+	rm qemu-aarch64-static.tar.gz
+
+calico/felix: calico/felix-$(ARCH)
+
+calico/felix-$(ARCH): bin/calico-felix-$(ARCH) register docker-image/qemu-ppc64le-static docker-image/qemu-aarch64-static
+	rm -rf docker-image/bin
+	mkdir -p docker-image/bin
+	cp bin/calico-felix-$(ARCH) docker-image/bin/calico-felix
+	docker build --pull -t calico/felix-$(ARCH) --file ./docker-image/Dockerfile-$(ARCH) docker-image
 
 # Figure out version information.  To support builds from release tarballs, we default to
 # <unknown> if this isn't a git checkout.
@@ -159,12 +190,12 @@ MY_GID:=$(shell id -g)
 # Build a docker image used for building debs for trusty.
 .PHONY: calico-build/trusty
 calico-build/trusty:
-	cd docker-build-images && docker build -f ubuntu-trusty-build.Dockerfile$(ARCHTAG) -t calico-build/trusty .
+	cd docker-build-images && docker build -f ubuntu-trusty-build.Dockerfile-$(ARCH) -t calico-build/trusty .
 
 # Build a docker image used for building debs for xenial.
 .PHONY: calico-build/xenial
 calico-build/xenial:
-	cd docker-build-images && docker build -f ubuntu-xenial-build.Dockerfile$(ARCHTAG) -t calico-build/xenial .
+	cd docker-build-images && docker build -f ubuntu-xenial-build.Dockerfile-$(ARCH) -t calico-build/xenial .
 
 # Construct a docker image for building Centos 7 RPMs.
 .PHONY: calico-build/centos7
@@ -173,7 +204,7 @@ calico-build/centos7:
 	  docker build \
 	  --build-arg=UID=$(MY_UID) \
 	  --build-arg=GID=$(MY_GID) \
-	  -f centos7-build.Dockerfile$(ARCHTAG) \
+	  -f centos7-build.Dockerfile-$(ARCH) \
 	  -t calico-build/centos7 .
 
 ifeq ("$(ARCH)","ppc64le")
@@ -191,34 +222,17 @@ calico-build/centos6:
 	  docker build \
 	  --build-arg=UID=$(MY_UID) \
 	  --build-arg=GID=$(MY_GID) \
-	  -f centos6-build.Dockerfile$(ARCHTAG) \
+	  -f centos6-build.Dockerfile-$(ARCH) \
 	  -t calico-build/centos6 .
 
 # Build the calico/felix docker image, which contains only Felix.
-.PHONY: calico/felix calico/felix$(ARCHTAG) register 
-
-# Enable binfmt adding support for miscellaneous binary formats.
-# This is needed for building non-native images.
-register:
-	sudo docker run --rm --privileged multiarch/qemu-user-static:register || true
-
-docker-image/qemu-ppc64le-static:
-	wget https://github.com/multiarch/qemu-user-static/releases/download/v2.9.1/qemu-ppc64le-static.tar.gz
-	tar zxvf qemu-ppc64le-static.tar.gz -C docker-image
-	rm qemu-ppc64le-static.tar.gz
-
-docker-image/qemu-aarch64-static:
-	wget https://github.com/multiarch/qemu-user-static/releases/download/v2.9.1-1/qemu-aarch64-static.tar.gz
-	tar zxvf qemu-aarch64-static.tar.gz  -C docker-image
-	rm qemu-aarch64-static.tar.gz
-
-calico/felix: calico/felix$(ARCHTAG)
-
-calico/felix$(ARCHTAG): bin/calico-felix-$(ARCH) register docker-image/qemu-ppc64le-static docker-image/qemu-aarch64-static
+.PHONY: calico/felix calico/felix-$(ARCH)
+calico/felix: calico/felix-$(ARCH)
+calico/felix-$(ARCH): bin/calico-felix-$(ARCH) register docker-image/qemu-ppc64le-static docker-image/qemu-aarch64-static
 	rm -rf docker-image/bin
 	mkdir -p docker-image/bin
 	cp bin/calico-felix-$(ARCH) docker-image/bin/calico-felix
-	docker build --pull -t calico/felix$(ARCHTAG) --file ./docker-image/Dockerfile$(ARCHTAG) docker-image
+	docker build --pull -t calico/felix-$(ARCH) --file ./docker-image/Dockerfile-$(ARCH) docker-image
 
 # Targets for Felix testing with the k8s backend and a k8s API server,
 # with k8s model resources being injected by a separate test client.
@@ -443,15 +457,15 @@ $(FV_TESTS): vendor/.up-to-date $(FELIX_GO_FILES)
 	$(DOCKER_GO_BUILD) go test ./$(shell dirname $@) -c --tags fvtests -o $@
 
 .PHONY: fv
-fv: calico/felix bin/iptables-locker bin/test-workload bin/test-connection $(FV_TESTS)
+fv: calico/felix-$(ARCH) native bin/iptables-locker bin/test-workload bin/test-connection $(FV_TESTS)
 	# Copy the ginkgo binary out of the container since we need to run the fv tests directly
 	# on the host (because they need to be able to manipulate docker).  It'd be even nicer
 	# if we could give the build container access to the docker API but we've so-far struggled
 	# to get that working.
 	@echo Running Go FVs.
 	$(DOCKER_GO_BUILD) cp /go/bin/ginkgo bin/ginkgo
-	# fv.test is not expecting a container name with an ARCHTAG.
-	-docker tag calico/felix$(ARCHTAG) calico/felix
+	# fv.test is not expecting a container name with an ARCH tag, fix me.
+	-docker tag calico/felix-$(ARCH) calico/felix
 	for t in $(FV_TESTS); do \
 	    cd $(TOPDIR)/`dirname $$t` && \
 	    FV_ETCDIMAGE=$(FV_ETCDIMAGE) \
